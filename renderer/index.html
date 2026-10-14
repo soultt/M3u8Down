@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; media-src 'self' file:; style-src 'self' 'unsafe-inline';">
+<title>M3U8 下载器</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <!-- 自建标题栏 -->
+  <div class="titlebar">
+    <div class="title-drag">
+      <span class="title-icon">▶</span>
+      <span class="title-text">M3U8 视频下载器</span>
+    </div>
+    <div class="win-controls">
+      <button id="win-min" class="win-btn" title="最小化">
+        <svg viewBox="0 0 12 12"><rect x="2" y="5" width="8" height="2" rx="0.5" fill="currentColor"/></svg>
+      </button>
+      <button id="win-max" class="win-btn" title="最大化/还原">
+        <svg viewBox="0 0 12 12"><rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+      </button>
+      <button id="win-close" class="win-btn close" title="关闭">
+        <svg viewBox="0 0 12 12"><path d="M2.5 2.5 L9.5 9.5 M9.5 2.5 L2.5 9.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="download">下载</button>
+    <button class="tab" data-tab="merge">合并</button>
+    <button class="tab" data-tab="settings">设置</button>
+    <div class="tab-right"></div>
+  </nav>
+
+  <!-- 下载页 -->
+  <section id="page-download" class="page active">
+    <div class="add-bar">
+      <button id="btn-add-open" class="btn primary">＋ 新增下载</button>
+      <span class="muted">支持 .m3u8 (http/https)，多线程分片下载</span>
+      <span id="dl-summary" class="muted" style="margin-left:auto;"></span>
+    </div>
+
+    <div id="dl-list" class="dl-list"></div>
+    <div id="dl-empty" class="empty">暂无下载任务，点击「＋ 新增下载」开始</div>
+  </section>
+
+  <!-- 合并页 -->
+  <section id="page-merge" class="page">
+    <div class="add-bar">
+      <button id="btn-open-merge-modal" class="btn primary">选择 TS 片段并合并</button>
+      <span class="muted">选择包含 .ts 分片的目录或文件，合并为 MP4</span>
+    </div>
+
+    <div class="list-head"><span>合并任务进度</span></div>
+    <div id="merge-jobs" class="merge-jobs"></div>
+    <div id="merge-empty-jobs" class="empty">暂无合并任务</div>
+  </section>
+
+  <!-- 设置页 -->
+  <section id="page-settings" class="page">
+    <div class="settings-card">
+      <div class="settings-title">FFmpeg</div>
+      <div class="settings-desc">应用已内置 ffmpeg，通常无需设置。仅在内置版本异常时，可手动指定 ffmpeg 可执行文件。</div>
+      <div class="settings-status" id="ffmpeg-status">检测中…</div>
+      <div class="settings-actions">
+        <button id="btn-set-ffmpeg" class="btn">手动指定 ffmpeg</button>
+        <button id="btn-reset-ffmpeg" class="btn ghost">恢复使用内置 ffmpeg</button>
+      </div>
+    </div>
+  </section>
+</div>
+
+<!-- 新增下载弹窗 -->
+<div id="modal-mask" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span>新增下载</span>
+      <button id="modal-x" class="modal-x">×</button>
+    </div>
+    <div class="modal-body">
+      <label class="field">
+        <span class="field-label">M3U8 地址 <em>*</em></span>
+        <input id="in-url" type="text" placeholder="https://example.com/index.m3u8" />
+      </label>
+      <label class="field">
+        <span class="field-label">保存名称</span>
+        <input id="in-name" type="text" placeholder="留空则自动命名" />
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">下载线程数</span>
+          <input id="in-conc" type="number" min="1" max="32" value="8" />
+        </label>
+      </div>
+      <div class="field">
+        <span class="field-label">保存目录（分片临时文件）</span>
+        <div class="dir-row">
+          <input id="in-savedir" type="text" placeholder="默认：应用数据目录\downloads" />
+          <button id="btn-choose-savedir" type="button" class="btn">选择目录</button>
+        </div>
+      </div>
+
+      <label class="check-field">
+        <input id="in-automerge" type="checkbox" checked />
+        <span>下载完成后自动合并为 MP4</span>
+      </label>
+
+      <div id="auto-merge-box" class="auto-merge-box">
+        <div class="field">
+          <span class="field-label">MP4 文件名</span>
+          <input id="in-outname" type="text" placeholder="留空则使用保存名称" />
+        </div>
+        <div class="field">
+          <span class="field-label">MP4 输出目录</span>
+          <div class="dir-row">
+            <input id="in-outdir" type="text" placeholder="默认：分片任务所在目录" />
+            <button id="btn-choose-outdir" type="button" class="btn">选择目录</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="modal-error" class="modal-error hidden"></div>
+    </div>
+    <div class="modal-foot">
+      <button id="modal-cancel" class="btn">取消</button>
+      <button id="modal-ok" class="btn primary">开始下载</button>
+    </div>
+  </div>
+</div>
+
+<!-- 删除确认弹窗 -->
+<div id="confirm-mask" class="modal-mask hidden">
+  <div class="confirm-modal">
+    <div class="confirm-icon">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none">
+        <path d="M12 8v5" stroke="#f59e0b" stroke-width="2" stroke-linecap="round"/>
+        <circle cx="12" cy="16.6" r="1.2" fill="#f59e0b"/>
+        <path d="M10.3 3.9 2.9 17a2 2 0 0 0 1.7 3h14.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"
+          stroke="#f59e0b" stroke-width="1.6" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <div class="confirm-body">
+      <div class="confirm-title">删除下载任务</div>
+      <div class="confirm-text">
+        确定删除任务「<span id="confirm-name"></span>」吗？
+      </div>
+      <label class="confirm-check">
+        <input id="confirm-delete-files" type="checkbox" />
+        <span>同时删除已下载的分片与视频文件</span>
+      </label>
+      <div id="confirm-tip" class="confirm-tip">不勾选则仅从列表移除，文件会保留在磁盘中。</div>
+    </div>
+    <div class="confirm-foot">
+      <button id="confirm-cancel" class="btn">取消</button>
+      <button id="confirm-ok" class="btn danger-strong">确认删除</button>
+    </div>
+  </div>
+</div>
+
+<!-- 合并设置弹窗 -->
+<div id="merge-mask" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span>合并为 MP4</span>
+      <button id="merge-x" class="modal-x">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <span class="field-label">TS 片段来源</span>
+        <div class="dir-row">
+          <input id="manual-segdir" type="text" placeholder="点击右侧按钮选择 .ts 分片目录或文件" readonly />
+          <button id="btn-pick-segdir" type="button" class="btn">选择目录</button>
+          <button id="btn-pick-segfiles" type="button" class="btn">多选文件</button>
+        </div>
+        <div id="manual-info" class="field-hint"></div>
+      </div>
+
+      <div class="field">
+        <span class="field-label">MP4 输出目录</span>
+        <div class="dir-row">
+          <input id="merge-out-dir" type="text" placeholder="默认输出到 TS 片段所在目录" />
+          <button id="btn-merge-out-dir" type="button" class="btn">选择目录</button>
+        </div>
+      </div>
+
+      <label class="field">
+        <span class="field-label">MP4 文件名</span>
+        <input id="manual-outname" type="text" placeholder="留空则自动命名" />
+      </label>
+
+      <div id="merge-modal-error" class="modal-error hidden"></div>
+    </div>
+    <div class="modal-foot">
+      <button id="merge-modal-cancel" class="btn">取消</button>
+      <button id="btn-manual-merge" class="btn primary">开始合并</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

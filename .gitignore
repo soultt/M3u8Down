@@ -1,0 +1,19 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+
+# 运行时数据目录
+.appdata/
+
+# 日志与临时文件
+*.log
+_smoke.js
+run.log
+
+# 系统/编辑器
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
