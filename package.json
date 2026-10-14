@@ -14,6 +14,7 @@
   "build": {
     "appId": "com.m3u8down.app",
     "productName": "M3u8Down",
+    "executableName": "M3u8Down",
     "copyright": "Copyright © 2026",
     "compression": "normal",
     "files": [

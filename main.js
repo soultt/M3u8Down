@@ -6,6 +6,10 @@ const Merger = require('./src/merger');
 const Store = require('./src/store');
 const { registerSegProtocol } = require('./src/protocols');
 
+// Windows 任务栏/通知身份与打包后 exe 名保持一致
+app.setAppUserModelId('com.m3u8down.app');
+app.setName('M3u8Down');
+
 let mainWindow;
 const dataArg = process.argv.find((a) => a.startsWith('--data-dir='));
 if (dataArg) {

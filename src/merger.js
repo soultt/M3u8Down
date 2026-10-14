@@ -60,20 +60,26 @@ function buildConcatSpec(segAbsList, workDir) {
 /**
  * 构造“重编码规整时间戳”的 ffmpeg 参数。
  * concat demuxer 把所有分片合并为一条输入；通过：
- *   - -fflags +genpts            重建 PTS
- *   - setpts=PTS-STARTPTS        视频时间戳归零并连续化
- *   - asetpts=PTS-STARTPTS       音频时间戳归零并连续化
- *   - 固定帧率(cfr)/像素格式/采样率   消除分片边界参数差异
- * 从根上解决 -c copy 拼接在衔接处跳帧/快进的问题。
+ *   - -fflags +genpts+discardcorrupt  重建 PTS 并丢弃损坏时间戳（防止分片坏时间戳带毒拼接）
+ *   - fps=SRC_FPS                     跟随源帧率做 CFR 归一化（不能硬编码 30，否则 25/29.97fps 源会变速卡顿）
+ *   - setpts=PTS-STARTPTS             视频时间戳归零并连续化
+ *   - aresample=async=1000            音频在分片边界补偿空洞/堆积（1000 样本，比 1 更稳）
+ *   - asetpts=PTS-STARTPTS            音频时间戳归零并连续化
+ *   - -fps_mode cfr                   明确恒定帧率输出（新版 ffmpeg，旧版 -vsync cfr 同义）
+ * 从根上解决拼接处跳帧/快进/音画漂移问题。
  */
-function buildConcatEncodeArgs(listArg, safe, output, hasAudio) {
-  const input = ['-y', '-fflags', '+genpts'];
+function buildConcatEncodeArgs(listArg, safe, output, hasAudio, fps) {
+  // 跟随源帧率；探测不到时回退 30（仅兜底，绝大多数 HLS 为 25/29.97/30）
+  const fpsNum = (fps && fps > 0 && fps <= 240) ? Math.round(fps * 1000) / 1000 : 30;
+
+  const input = ['-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
   if (safe) input.push('-f', 'concat', '-safe', '0');
   else input.push('-f', 'concat');
   input.push('-i', listArg);
 
   const vf = [
     'setpts=PTS-STARTPTS',
+    `fps=${fpsNum}`, // 跟随源帧率做 CFR 归一化，避免 -r 与源时间基冲突
     'scale=trunc(iw/2)*2:trunc(ih/2)*2' // H.264 需偶数宽高
   ];
 
@@ -81,9 +87,9 @@ function buildConcatEncodeArgs(listArg, safe, output, hasAudio) {
     return [
       ...input,
       '-vf', vf.join(','),
-      '-r', '30',
+      '-fps_mode', 'cfr',
       '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
-      '-af', 'aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS',
+      '-af', 'aresample=async=1000:first_pts=0,asetpts=PTS-STARTPTS',
       '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
       '-movflags', '+faststart',
       output
@@ -92,7 +98,7 @@ function buildConcatEncodeArgs(listArg, safe, output, hasAudio) {
   return [
     ...input,
     '-vf', vf.join(','),
-    '-r', '30',
+    '-fps_mode', 'cfr',
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
     '-an',
     '-movflags', '+faststart',
@@ -185,6 +191,75 @@ class Merger extends EventEmitter {
       } catch (_) {
         done(true);
       }
+    });
+  }
+
+  /**
+   * 探测首个分片的视频帧率（用于重编码时跟随源帧率，避免 25fps 源被强制 30fps 而变速卡顿）。
+   * 优先用 ffprobe（与 ffmpeg 同目录），拿不到则解析 ffmpeg -i 的 stderr 中的 tbr 帧率。
+   * 任何失败都安全返回 null（调用方回退默认帧率）。
+   */
+  _probeFps(exe, cwd, file) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+
+      // 1) 优先 ffprobe（ffmpeg-static 只带 ffmpeg，探测同目录是否有 ffprobe）
+      const ffprobe = path.join(path.dirname(exe), 'ffprobe' + (process.platform === 'win32' ? '.exe' : ''));
+      if (fs.existsSync(ffprobe)) {
+        try {
+          const p = spawn(ffprobe, [
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=r_frame_rate,avg_frame_rate',
+            '-of', 'default=noprint_wrappers=1',
+            file
+          ], { cwd, windowsHide: true });
+          let out = '';
+          p.stdout.on('data', (d) => (out += d.toString()));
+          p.on('error', () => parseViaFfmpeg());
+          p.on('close', (code) => {
+            if (code !== 0) return parseViaFfmpeg();
+            // r_frame_rate=25/1 或 30000/1001
+            const m = out.match(/r_frame_rate=(\d+)\/(\d+)/);
+            if (m && parseInt(m[2], 10) > 0) {
+              const f = parseInt(m[1], 10) / parseInt(m[2], 10);
+              if (f > 0 && f <= 240) return done(f);
+            }
+            parseViaFfmpeg();
+          });
+          return;
+        } catch (_) { /* 落到 ffmpeg 解析 */ }
+      }
+
+      const parseViaFfmpeg = () => {
+        try {
+          const p = spawn(exe, ['-hide_banner', '-i', file], { cwd, windowsHide: true });
+          let out = '';
+          p.stderr.on('data', (d) => {
+            out += d.toString();
+            // 形如: Stream #0:0: Video: h264 ..., 25 tbr, 90k tbn, 50 tbc
+            // 或 29.97 tbr
+            if (/tbr/.test(out)) {
+              const m = out.match(/,\s*([\d.]+)\s+tbr/);
+              if (m) {
+                const f = parseFloat(m[1]);
+                if (f > 0 && f <= 240) return done(f);
+              }
+            }
+            if (/At least one output file must be specified|Output #/.test(out)) done(null);
+          });
+          p.on('error', () => done(null));
+          p.on('close', () => {
+            const m = out.match(/,\s*([\d.]+)\s+tbr/);
+            done(m ? parseFloat(m[1]) : null);
+          });
+        } catch (_) {
+          done(null);
+        }
+      };
+
+      parseViaFfmpeg();
     });
   }
 
@@ -309,8 +384,13 @@ class Merger extends EventEmitter {
 
     // HLS 分片各自带独立/非连续时间戳，直接 -c copy 拼接会在衔接处出现跳帧、快进。
     // 因此重编码并逐段重置 PTS/DTS，统一帧率/像素格式/采样率，保证音视频严格连续。兼容有/无音频。
-    const useAudio = segAbsList.length > 0 ? await this._hasAudio(exe, concat.cwd, segAbsList[0]) : true;
-    const args = buildConcatEncodeArgs(concat.listArg, concat.safe, finalOutput, useAudio);
+    const firstSeg = segAbsList[0];
+    const [useAudio, srcFps] = await Promise.all([
+      segAbsList.length > 0 ? this._hasAudio(exe, concat.cwd, firstSeg) : Promise.resolve(true),
+      segAbsList.length > 0 ? this._probeFps(exe, concat.cwd, firstSeg) : Promise.resolve(null)
+    ]);
+    // 跟随源帧率归一化（探测不到时函数内部回退 30）
+    const args = buildConcatEncodeArgs(concat.listArg, concat.safe, finalOutput, useAudio, srcFps);
 
     const applySegProgress = () => {
       job.segIndex = lastIndex;
@@ -380,42 +460,61 @@ class Merger extends EventEmitter {
       .sort()
       .map((f) => path.join(dir, f));
   }
-
-  /**
-   * 将指定 ts 片段快速 remux 为临时 MP4，用于播放（Chromium 不稳定支持 MPEG-TS MSE）。
-   * 返回 Promise<{ok, file, error}>
-   */
-  buildPreviewMp4(segFiles, outFile) {
-    return new Promise(async (resolve) => {
-      const exe = await this._probeFfmpeg();
-      if (!exe) return resolve({ ok: false, error: '未检测到内嵌 ffmpeg' });
-      const list = (segFiles || []).filter((f) => fs.existsSync(f) && isValidTs(f));
-      if (!list.length) return resolve({ ok: false, error: '暂无可播放的有效分片（可能尚未下载完整）' });
-
-      const concat = buildConcatSpec(list, path.dirname(outFile));
-      try {
-        fs.writeFileSync(concat.listFile, concat.listContent, 'utf8');
-      } catch (e) {
-        return resolve({ ok: false, error: '无法写入临时合并列表：' + e.message });
-      }
-      try { if (fs.existsSync(outFile)) fs.unlinkSync(outFile); } catch (_) {}
-
-      // 与正式合并一致：重编码并规整时间戳，避免预览播放出现快进/跳帧
-      const hasAudio = await this._hasAudio(exe, concat.cwd, list[0]);
-      const args = buildConcatEncodeArgs(concat.listArg, concat.safe, outFile, hasAudio);
-      const proc = spawn(exe, args, { cwd: concat.cwd, windowsHide: true });
-
-      let stderr = '';
-      proc.stderr.on('data', (d) => { stderr += d.toString(); });
-      proc.on('error', (err) => resolve({ ok: false, error: err.message }));
-      proc.on('close', (code) => {
-        try { fs.unlinkSync(concat.listFile); } catch (_) {}
-        if (code === 0 && fs.existsSync(outFile)) return resolve({ ok: true, file: outFile });
-        const tail = stderr.split('\n').map((x) => x.trim()).filter(Boolean).slice(-3).join(' ');
-        resolve({ ok: false, error: tail || ('ffmpeg exit ' + code) });
-      });
-    });
-  }
 }
+
+/**
+ * 构造“快速合并（stream copy）”的 ffmpeg 参数。
+ * 仅用于播放预览等临时场景：不重编码、速度快，
+ * 但不重建时间戳——同一 m3u8 分片来自同一编码流水线，通常可正常播放；
+ * 正式合并请使用 buildConcatEncodeArgs（重编码规整 PTS/DTS）。
+ */
+function buildConcatCopyArgs(listArg, safe, output) {
+  const input = ['-y'];
+  if (safe) input.push('-f', 'concat', '-safe', '0');
+  else input.push('-f', 'concat');
+  input.push('-i', listArg);
+  return [
+    ...input,
+    '-c', 'copy',
+    '-movflags', '+faststart',
+    output
+  ];
+}
+
+/**
+ * 将指定 ts 片段快速 remux 为临时 MP4，用于播放（Chromium 不稳定支持 MPEG-TS MSE）。
+ * 与合并页/自动合并区分：播放预览用 -c copy 极速产出临时文件，不重编码、不规整时间戳。
+ * 返回 Promise<{ok, file, error}>
+ */
+Merger.prototype.buildPreviewMp4 = function (segFiles, outFile) {
+  return new Promise(async (resolve) => {
+    const exe = await this._probeFfmpeg();
+    if (!exe) return resolve({ ok: false, error: '未检测到内嵌 ffmpeg' });
+    const list = (segFiles || []).filter((f) => fs.existsSync(f) && isValidTs(f));
+    if (!list.length) return resolve({ ok: false, error: '暂无可播放的有效分片（可能尚未下载完整）' });
+
+    const concat = buildConcatSpec(list, path.dirname(outFile));
+    try {
+      fs.writeFileSync(concat.listFile, concat.listContent, 'utf8');
+    } catch (e) {
+      return resolve({ ok: false, error: '无法写入临时合并列表：' + e.message });
+    }
+    try { if (fs.existsSync(outFile)) fs.unlinkSync(outFile); } catch (_) {}
+
+    // 快速合并：concat demuxer + -c copy，不做转码
+    const args = buildConcatCopyArgs(concat.listArg, concat.safe, outFile);
+    const proc = spawn(exe, args, { cwd: concat.cwd, windowsHide: true });
+
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', (err) => resolve({ ok: false, error: err.message }));
+    proc.on('close', (code) => {
+      try { fs.unlinkSync(concat.listFile); } catch (_) {}
+      if (code === 0 && fs.existsSync(outFile)) return resolve({ ok: true, file: outFile });
+      const tail = stderr.split('\n').map((x) => x.trim()).filter(Boolean).slice(-3).join(' ');
+      resolve({ ok: false, error: tail || ('ffmpeg exit ' + code) });
+    });
+  });
+};
 
 module.exports = Merger;

@@ -113,30 +113,53 @@ async function fetchToFile(url, filePath, expectedSize = null, signal) {
 }
 
 /**
- * 解析 m3u8：支持 master playlist 选最高码率、相对路径、AES-128 解密
+ * 解析 #EXT-X-KEY 标签（兼容属性带引号/不带引号、大小写、IV 带 0x 前缀等写法）。
+ * 支持一个 m3u8 中多次出现 EXT-X-KEY（包括中途 METHOD=NONE 取消加密）。
+ * 返回 { method, uri, iv } 或 null
+ */
+function parseExtXKey(line, baseUrl) {
+  const methodM = line.match(/METHOD\s*=\s*("[^"]*"|[^,]+)/i);
+  if (!methodM) return null;
+  const method = methodM[1].replace(/^"|"$/g, '').trim().toUpperCase();
+  if (method === 'NONE' || !method) return { method: 'NONE', uri: null, iv: null };
+
+  const uriM = line.match(/URI\s*=\s*"([^"]*)"/i);
+  let keyUri = null;
+  if (uriM && uriM[1]) {
+    const raw = uriM[1].trim();
+    // data: 内联 key（base64）原样保留，下载阶段直接解码
+    if (/^data:/i.test(raw)) {
+      keyUri = raw;
+    } else {
+      try { keyUri = new URL(raw, baseUrl).toString(); } catch (_) { keyUri = raw; }
+    }
+  }
+
+  let ivBuf = null;
+  const ivM = line.match(/IV\s*=\s*("[^"]*"|[^,]+)/i);
+  if (ivM) {
+    const ivRaw = ivM[1].replace(/^"|"$/g, '').trim().replace(/^0x/i, '');
+    // 16 字节 IV 以 32 位 hex 表示；非标准长度左补 0
+    if (ivRaw) ivBuf = Buffer.from(ivRaw.padStart(32, '0'), 'hex');
+  }
+  return { method, uri: keyUri, iv: ivBuf };
+}
+
+/**
+ * 解析 m3u8：支持 master playlist 选最高码率、相对路径、AES-128/192/256-CBC 解密
  */
 function parseM3U(text, baseUrl) {
   const lines = text.split(/\r?\n/);
   let key = null; // {method, uri, iv}
   let seq = 0;
   const segments = [];
-  let allowCache = null;
 
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i];
     const line = raw.trim();
     if (!line || line.startsWith('#EXT')) {
       if (line.startsWith('#EXT-X-KEY')) {
-        const m = line.match(/METHOD=([^,]+)/);
-        const u = line.match(/URI="([^"]+)"/);
-        const iv = line.match(/IV=([^,]+)/);
-        if (m) {
-          key = {
-            method: m[1],
-            uri: u ? new URL(u[1], baseUrl).toString() : null,
-            iv: iv ? Buffer.from(iv[1].replace('0x', '').padStart(32, '0'), 'hex') : null
-          };
-        }
+        key = parseExtXKey(line, baseUrl);
       } else if (line.startsWith('#EXT-X-MEDIA-SEQUENCE')) {
         seq = parseInt(line.split(':')[1], 10) || 0;
       }
@@ -196,6 +219,13 @@ class DownloadManager extends EventEmitter {
       if (!fs.existsSync(tf)) return false;
       const t = JSON.parse(fs.readFileSync(tf, 'utf8'));
       if (['downloading', 'pausing', 'merging', 'parsing'].includes(t.status)) t.status = 'paused';
+      // key 缓存经 JSON 往返后 Buffer 会退化为 {type:'Buffer',data:[...]} 普通对象，
+      // 无法再用于 createDecipheriv；恢复时清空，首个加密分片会重新拉取并缓存为真正的 Buffer
+      if (t.keyCache && typeof t.keyCache === 'object') {
+        for (const k of Object.keys(t.keyCache)) {
+          if (!Buffer.isBuffer(t.keyCache[k])) delete t.keyCache[k];
+        }
+      }
       this.tasks.set(t.id, t);
       return true;
     } catch (_) {
@@ -298,16 +328,79 @@ class DownloadManager extends EventEmitter {
     return parsed.segments;
   }
 
-  async _getKey(task, seg) {
+  /**
+   * 规范化 key 字节：
+   * - data: URI（base64 内联 key）直接解码
+   * - 服务器返回 32 字符 hex 文本（常见伪二进制写法）时按 hex 解为 16 字节
+   * - 其它情况按原始二进制返回（16/24/32 字节分别对应 AES-128/192/256）
+   */
+  _normalizeKey(k, raw) {
+    if (/^data:/i.test(k.uri || '')) {
+      const u = k.uri;
+      const comma = u.indexOf(',');
+      if (comma < 0) throw new Error('data: key URI 格式异常');
+      const meta = u.slice(5, comma).toLowerCase();
+      const payload = u.slice(comma + 1);
+      if (meta.includes(';base64')) return Buffer.from(payload, 'base64');
+      return Buffer.from(decodeURIComponent(payload), 'binary');
+    }
+    // 去掉首尾空白/换行（部分 key 服务会附带 \n）
+    let buf = raw;
+    if (buf.length > 0) {
+      const start = buf[0] === 0x0a || buf[0] === 0x0d ? 1 : 0;
+      let end = buf.length;
+      while (end > start && (buf[end - 1] === 0x0a || buf[end - 1] === 0x0d)) end--;
+      if (end !== buf.length || start !== 0) buf = buf.slice(start, end);
+    }
+    // 32 个可见 ASCII hex 字符 → 当作 16 字节二进制 key
+    if (buf.length === 32 && /^[0-9a-fA-F]{32}$/.test(buf.toString('latin1'))) {
+      return Buffer.from(buf.toString('latin1'), 'hex');
+    }
+    return buf;
+  }
+
+  async _getKey(task, seg, signal) {
     const k = seg.key;
     if (!k || k.method === 'NONE') return null;
-    if (k.method !== 'AES-128') throw new Error('暂不支持的加密方式: ' + k.method);
-    if (task.keyCache[k.uri]) return task.keyCache[k.uri];
-    const res = await fetchUrl(k.uri);
-    const chunks = [];
-    for await (const c of res) chunks.push(c);
-    const keyBuf = Buffer.concat(chunks);
-    task.keyCache[k.uri] = keyBuf;
+    if (!/^AES-(128|192|256)$/i.test(k.method)) {
+      throw new Error('暂不支持的加密方式: ' + k.method);
+    }
+    const cacheKey = k.uri || '__inline__';
+    const cached = task.keyCache[cacheKey];
+    // 仅当缓存是真正的 Buffer 才复用；JSON 往返后会退化为普通对象，需重新获取
+    if (cached && Buffer.isBuffer(cached)) return cached;
+
+    let keyBuf;
+    if (/^data:/i.test(k.uri || '')) {
+      keyBuf = this._normalizeKey(k, Buffer.alloc(0));
+    } else if (k.uri) {
+      // key 服务偶发 403/超时：最多重试 3 次
+      let lastErr;
+      for (let i = 0; i < 3; i++) {
+        try {
+          const res = await fetchUrl(k.uri, 0, signal);
+          const chunks = [];
+          for await (const c of res) chunks.push(c);
+          keyBuf = this._normalizeKey(k, Buffer.concat(chunks));
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (signal && signal.aborted) throw e;
+          await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+        }
+      }
+      if (lastErr) throw lastErr;
+    } else {
+      throw new Error('加密分片缺少 key URI');
+    }
+
+    // key 长度必须匹配算法：AES-128=16, AES-192=24, AES-256=32
+    const expectLen = { 'AES-128': 16, 'AES-192': 24, 'AES-256': 32 }[k.method.toUpperCase()];
+    if (keyBuf.length !== expectLen) {
+      throw new Error(`key 长度 ${keyBuf.length} 与 ${k.method} 要求的 ${expectLen} 字节不匹配`);
+    }
+    task.keyCache[cacheKey] = keyBuf;
     return keyBuf;
   }
 
@@ -341,14 +434,25 @@ class DownloadManager extends EventEmitter {
 
     const decryptIfNeeded = async (buf, seg) => {
       if (!seg.key || seg.key.method === 'NONE') return buf;
-      const keyBuf = await this._getKey(task, seg);
+      const keyBuf = await this._getKey(task, seg, control.signal);
+      // RFC 8216：EXT-X-KEY 未显式给出 IV 时，IV = 该分片媒体序列号（128-bit 大端）
       let ivUse = seg.key.iv;
       if (!ivUse) {
         ivUse = Buffer.alloc(16);
         ivUse.writeBigUInt64BE(BigInt(seg.seq), 8);
       }
-      const decipher = crypto.createDecipheriv('aes-128-cbc', keyBuf, ivUse);
-      return Buffer.concat([decipher.update(buf), decipher.final()]);
+      // 动态算法：aes-128-cbc / aes-192-cbc / aes-256-cbc
+      const algo = (seg.key.method + '-cbc').toLowerCase();
+      // 终极保险：确保 key/iv 是 Buffer（历史 task.json 反序列化或异常路径可能残留普通对象）
+      const safeKey = Buffer.isBuffer(keyBuf) ? keyBuf : Buffer.from(keyBuf);
+      if (!Buffer.isBuffer(ivUse)) ivUse = Buffer.from(ivUse);
+      const decipher = crypto.createDecipheriv(algo, safeKey, ivUse);
+      decipher.setAutoPadding(true);
+      try {
+        return Buffer.concat([decipher.update(buf), decipher.final()]);
+      } catch (e) {
+        throw new Error('解密失败（key/IV 不匹配或分片损坏）: ' + e.message);
+      }
     };
 
     const downloadOne = async (idx, seg, retry = 0) => {
