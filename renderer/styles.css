@@ -158,9 +158,10 @@ input[type=text]:focus, input[type=number]:focus { border-color: #3b82f6; }
 .progress.completed > div { background: #22c55e; }
 .progress.error > div { background: #ef4444; }
 .progress-meta {
-  display: flex; justify-content: space-between; margin-top: 6px;
+  display: flex; justify-content: space-between; gap: 12px; margin-top: 6px;
   color: #6b7280; font-size: 12px;
 }
+.progress-meta .pct { color: #2563eb; font-weight: 600; font-variant-numeric: tabular-nums; }
 .dl-msg { color: #b45309; font-size: 12px; margin-top: 4px; }
 
 /* ===== 合并列表 ===== */

@@ -57,6 +57,49 @@ function buildConcatSpec(segAbsList, workDir) {
   return { cwd, listFile, listArg: listFile, listContent, safe: true };
 }
 
+/**
+ * 构造“重编码规整时间戳”的 ffmpeg 参数。
+ * concat demuxer 把所有分片合并为一条输入；通过：
+ *   - -fflags +genpts            重建 PTS
+ *   - setpts=PTS-STARTPTS        视频时间戳归零并连续化
+ *   - asetpts=PTS-STARTPTS       音频时间戳归零并连续化
+ *   - 固定帧率(cfr)/像素格式/采样率   消除分片边界参数差异
+ * 从根上解决 -c copy 拼接在衔接处跳帧/快进的问题。
+ */
+function buildConcatEncodeArgs(listArg, safe, output, hasAudio) {
+  const input = ['-y', '-fflags', '+genpts'];
+  if (safe) input.push('-f', 'concat', '-safe', '0');
+  else input.push('-f', 'concat');
+  input.push('-i', listArg);
+
+  const vf = [
+    'setpts=PTS-STARTPTS',
+    'scale=trunc(iw/2)*2:trunc(ih/2)*2' // H.264 需偶数宽高
+  ];
+
+  if (hasAudio) {
+    return [
+      ...input,
+      '-vf', vf.join(','),
+      '-r', '30',
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+      '-af', 'aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS',
+      '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+      '-movflags', '+faststart',
+      output
+    ];
+  }
+  return [
+    ...input,
+    '-vf', vf.join(','),
+    '-r', '30',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    '-an',
+    '-movflags', '+faststart',
+    output
+  ];
+}
+
 class Merger extends EventEmitter {
   constructor(downloadRoot) {
     super();
@@ -115,6 +158,33 @@ class Merger extends EventEmitter {
       p.stdout.on('data', (d) => (out += d.toString()));
       p.on('error', () => resolve(null));
       p.on('close', (code) => resolve(code === 0 ? exe : null));
+    });
+  }
+
+  /**
+   * 探测首个分片是否包含音频流（用 ffmpeg -i 解析流信息）。
+   * ffmpeg 不带 -i 输出会以非 0 退出，故只解析 stderr 文本。
+   */
+  _hasAudio(exe, cwd, file) {
+    return new Promise((resolve) => {
+      let out = '';
+      let settled = false;
+      const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+      try {
+        const p = spawn(exe, ['-hide_banner', '-i', file], { cwd, windowsHide: true });
+        p.stderr.on('data', (d) => {
+          out += d.toString();
+          // 看到流映射区即可判断，提前结束
+          if (/Stream .*Audio:/.test(out)) done(true);
+          else if (/At least one output file must be specified|Output #/.test(out)) {
+            done(/Stream .*Audio:/.test(out));
+          }
+        });
+        p.on('error', () => done(true));
+        p.on('close', () => done(/Stream .*Audio:/.test(out)));
+      } catch (_) {
+        done(true);
+      }
     });
   }
 
@@ -216,36 +286,57 @@ class Merger extends EventEmitter {
       throw new Error('无法写入临时合并列表：' + e.message);
     }
 
+    const totalFiles = segAbsList.length;
     const job = {
       id, taskId: taskId || null, name: safeOut, workDir: concat.cwd, output: finalOutput,
       status: 'running',
       percent: 0,
-      total: total || segAbsList.length,
+      total: total || totalFiles,
       processed: 0,
-      message: '合并中…',
+      segIndex: 0,        // 当前正在合并的分片序号（从 1 起）
+      segTotal: totalFiles,
+      segName: '',
+      message: `合并中（0/${totalFiles}）`,
       startedAt: Date.now()
     };
     this.jobs.set(id, job);
     this.emit('update', job);
 
-    // concat demuxer + copy（无损快速）
-    const args = concat.safe
-      ? ['-y', '-f', 'concat', '-safe', '0', '-i', concat.listArg, '-c', 'copy', '-bsf:a', 'aac_adtstoasc', finalOutput]
-      : ['-y', '-f', 'concat', '-i', concat.listArg, '-c', 'copy', '-bsf:a', 'aac_adtstoasc', finalOutput];
+    // 分片文件名 -> 序号（按 list 顺序，从 1 起）
+    const segOrder = new Map();
+    segAbsList.forEach((f, i) => segOrder.set(path.basename(f), i + 1));
+    let lastIndex = 0;
+
+    // HLS 分片各自带独立/非连续时间戳，直接 -c copy 拼接会在衔接处出现跳帧、快进。
+    // 因此重编码并逐段重置 PTS/DTS，统一帧率/像素格式/采样率，保证音视频严格连续。兼容有/无音频。
+    const useAudio = segAbsList.length > 0 ? await this._hasAudio(exe, concat.cwd, segAbsList[0]) : true;
+    const args = buildConcatEncodeArgs(concat.listArg, concat.safe, finalOutput, useAudio);
+
+    const applySegProgress = () => {
+      job.segIndex = lastIndex;
+      job.segName = segAbsList[lastIndex - 1] ? path.basename(segAbsList[lastIndex - 1]) : '';
+      // 进度条按已进入合并的分片占比推进，封顶 99，完成时再置 100
+      job.percent = totalFiles > 0 ? Math.min(99, Math.round((lastIndex / totalFiles) * 100)) : 0;
+      job.message = `合并中（第 ${lastIndex}/${totalFiles} 片）`;
+      this.emit('update', job);
+    };
 
     return new Promise((resolve) => {
       const proc = spawn(exe, args, { cwd: concat.cwd, windowsHide: true });
       this.procs.set(id, proc);
       let stderr = '';
+
       proc.stderr.on('data', (d) => {
         const s = d.toString();
         stderr += s;
-        // 通过 "Opening '<文件>'" 计数估算进度
-        const opens = s.match(/Opening '([^']+\.ts)'/g);
-        if (opens) {
-          job.processed = Math.min(job.total, job.processed + opens.length);
-          job.percent = Math.min(99, Math.round((job.processed / job.total) * 100));
-          this.emit('update', job);
+        // concat demuxer 解码时逐个打开分片：Opening '<文件名>'（可能一次 data 含多个）
+        const re = /Opening '([^']+\.ts)'/g;
+        let m;
+        while ((m = re.exec(s)) !== null) {
+          const base = path.basename(m[1].replace(/\//g, path.sep));
+          const idx = segOrder.get(base);
+          // 同名分片在重试/seek 时可能重复出现，取最大序号，保证单调
+          if (idx && idx > lastIndex) { lastIndex = idx; applySegProgress(); }
         }
       });
       proc.on('error', (err) => {
@@ -265,7 +356,9 @@ class Merger extends EventEmitter {
         if (code === 0 && fs.existsSync(finalOutput)) {
           job.status = 'completed';
           job.percent = 100;
-          job.message = skippedCount > 0 ? `合并完成（已跳过 ${skippedCount} 个无效分片）` : '合并完成';
+          job.segIndex = totalFiles;
+          const skipTxt = skippedCount > 0 ? `，已跳过 ${skippedCount} 个无效分片` : '';
+          job.message = `合并完成（${totalFiles}/${totalFiles} 片${skipTxt}）`;
         } else {
           job.status = 'error';
           const tail = stderr.split('\n').map((x) => x.trim()).filter(Boolean).slice(-4).join(' ');
@@ -307,18 +400,16 @@ class Merger extends EventEmitter {
       }
       try { if (fs.existsSync(outFile)) fs.unlinkSync(outFile); } catch (_) {}
 
-      const inputArgs = concat.safe
-        ? ['-f', 'concat', '-safe', '0', '-i', concat.listArg]
-        : ['-f', 'concat', '-i', concat.listArg];
-      const proc = spawn(exe, [
-        '-y', ...inputArgs,
-        '-c', 'copy', '-bsf:a', 'aac_adtstoasc', outFile
-      ], { cwd: concat.cwd, windowsHide: true });
+      // 与正式合并一致：重编码并规整时间戳，避免预览播放出现快进/跳帧
+      const hasAudio = await this._hasAudio(exe, concat.cwd, list[0]);
+      const args = buildConcatEncodeArgs(concat.listArg, concat.safe, outFile, hasAudio);
+      const proc = spawn(exe, args, { cwd: concat.cwd, windowsHide: true });
 
       let stderr = '';
       proc.stderr.on('data', (d) => { stderr += d.toString(); });
       proc.on('error', (err) => resolve({ ok: false, error: err.message }));
       proc.on('close', (code) => {
+        try { fs.unlinkSync(concat.listFile); } catch (_) {}
         if (code === 0 && fs.existsSync(outFile)) return resolve({ ok: true, file: outFile });
         const tail = stderr.split('\n').map((x) => x.trim()).filter(Boolean).slice(-3).join(' ');
         resolve({ ok: false, error: tail || ('ffmpeg exit ' + code) });

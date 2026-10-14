@@ -312,7 +312,10 @@ function renderMergeJob(j) {
       <div class="progress ${j.status === 'completed' ? 'completed' : j.status === 'error' ? 'error' : ''}">
         <div style="width:${j.percent || 0}%"></div>
       </div>
-      <div class="progress-meta"><span>${escapeHtml(j.message || '')} ${j.percent || 0}%</span></div>
+      <div class="progress-meta">
+        <span>${escapeHtml(j.message || '')}</span>
+        <span class="pct">${j.percent || 0}%</span>
+      </div>
     </div>
     <button class="btn sm" data-jact="open" ${j.status !== 'completed' ? 'disabled' : ''}>打开文件</button>
     <button class="btn sm danger" data-jact="cancel" ${running ? '' : 'disabled'}>取消合并</button>
