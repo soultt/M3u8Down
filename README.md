@@ -114,6 +114,34 @@ npm run dist:dir
 > npm run dist
 > ```
 
+### 发布 GitHub Release
+
+```bash
+# 1. 升版本（同步更新 package.json 与 package-lock.json）
+npm version patch --no-git-tag-version
+git commit -am "chore: bump version"
+git push
+
+# 2. 打包产物
+npm run dist
+
+# 3. 创建 Release 并上传 dist/ 产物（tag 由当前版本号自动生成）
+npm run release
+
+# 预演：只打印将要执行的操作，不发任何写请求
+node scripts/release.js --dry-run
+```
+
+`scripts/release.js` 说明：
+
+- 版本号取自 `package.json`，生成 tag `v<version>`；仓库从 `git remote get-url origin` 自动解析。
+- Token 优先取环境变量 `GITHUB_TOKEN` / `GH_TOKEN`，否则用 `git credential fill` 复用 git 已缓存的凭据。
+- 默认上传 `dist/M3u8Down-Setup.exe` 与 `dist/M3u8Down-portable.exe`，可用 `--assets a.exe,b.exe` 指定。
+- 常用参数：`--notes <file>`（用文件作为 Release 描述）、`--draft`、`--prerelease`、`--overwrite`（先删同名资产再上传）。
+- 更新已存在的 Release 时，若不传 `--notes`，会保留原有描述，避免清掉手工编辑的内容。
+
+> **关于中文乱码**：不要用 PowerShell 的 `Invoke-RestMethod -Body <字符串>` 发送含中文的 JSON —— Windows PowerShell 5.1 会按本地代码页编码，导致描述里的中文整体变成 `?`。本脚本用 Node `fetch`（默认 UTF-8）规避该问题。若必须用命令行工具，请改用「UTF-8 文件 + `curl --ssl-no-revoke --data-binary "@file"`」发送。
+
 ### 应用图标
 
 仓库已包含 `build/icon.ico`。如需替换图标，将源图片命名为 `图标.png`（建议 ≥ 256×256 的正方形 PNG）放在项目根目录后执行：

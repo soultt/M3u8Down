@@ -9,7 +9,8 @@
     "dev": "electron . --data-dir=./.appdata",
     "icon": "electron make-icon.js",
     "dist": "electron-builder --win",
-    "dist:dir": "electron-builder --win --dir"
+    "dist:dir": "electron-builder --win --dir",
+    "release": "node scripts/release.js"
   },
   "build": {
     "appId": "com.m3u8down.app",
