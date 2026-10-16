@@ -72,7 +72,13 @@ function buildConcatEncodeArgs(listArg, safe, output, hasAudio, fps) {
   // 跟随源帧率；探测不到时回退 30（仅兜底，绝大多数 HLS 为 25/29.97/30）
   const fpsNum = (fps && fps > 0 && fps <= 240) ? Math.round(fps * 1000) / 1000 : 30;
 
-  const input = ['-y', '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'];
+  // -progress pipe:1：向 stdout 输出机器可读进度（out_time_us/speed），驱动真实进度条。
+  // -nostats/-loglevel error：关闭 stderr 的统计刷屏，只保留真正的错误信息用于报错。
+  const input = [
+    '-y', '-hide_banner', '-loglevel', 'error', '-nostats',
+    '-progress', 'pipe:1', '-stats_period', '0.25',
+    '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err'
+  ];
   if (safe) input.push('-f', 'concat', '-safe', '0');
   else input.push('-f', 'concat');
   input.push('-i', listArg);
@@ -263,6 +269,52 @@ class Merger extends EventEmitter {
     });
   }
 
+  /**
+   * 批量探测各分片时长（秒）。
+   * concat demuxer 不会报告总时长，ffmpeg-static 也不带 ffprobe，故按批次调用
+   * `ffmpeg -i a -i b ...`（只读各文件头，不解码），从 stderr 的
+   * `Input #n ... from '<file>'` 与其后的 `Duration:` 解析每片时长；
+   * 无法解析的分片返回 null，由调用方用平均值兜底。
+   */
+  _probeSegDurations(exe, cwd, files) {
+    const BATCH = 32;
+    const result = new Array(files.length).fill(null);
+
+    const runBatch = (batch) => new Promise((resolve) => {
+      const args = ['-hide_banner'];
+      for (const f of batch) args.push('-i', f);
+      let out = '';
+      let settled = false;
+      const done = () => { if (!settled) { settled = true; resolve(out); } };
+      let p;
+      try { p = spawn(exe, args, { cwd, windowsHide: true }); }
+      catch (_) { return resolve(''); }
+      p.stderr.on('data', (d) => { out += d.toString(); });
+      p.on('error', done);
+      p.on('close', done);
+    });
+
+    return (async () => {
+      for (let i = 0; i < files.length; i += BATCH) {
+        const batch = files.slice(i, i + BATCH);
+        const out = await runBatch(batch);
+        // 按 `Input #n` 分块，避免分片解析失败时 Duration 与文件错位
+        for (const blk of out.split(/Input #\d+/).slice(1)) {
+          const fm = blk.match(/from '([^']+)'/);
+          const dm = blk.match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
+          if (!fm || !dm) continue;
+          const base = path.basename(fm[1].replace(/\\/g, '/'));
+          const j = batch.findIndex((f) => path.basename(f) === base);
+          if (j >= 0) {
+            const sec = Number(dm[1]) * 3600 + Number(dm[2]) * 60 + parseFloat(dm[3]);
+            if (isFinite(sec) && sec > 0) result[i + j] = sec;
+          }
+        }
+      }
+      return result;
+    })();
+  }
+
   /** 扫描可合并的下载任务（分片完整） */
   scanTasks(manager) {
     const list = manager.listTasks();
@@ -377,11 +429,6 @@ class Merger extends EventEmitter {
     this.jobs.set(id, job);
     this.emit('update', job);
 
-    // 分片文件名 -> 序号（按 list 顺序，从 1 起）
-    const segOrder = new Map();
-    segAbsList.forEach((f, i) => segOrder.set(path.basename(f), i + 1));
-    let lastIndex = 0;
-
     // HLS 分片各自带独立/非连续时间戳，直接 -c copy 拼接会在衔接处出现跳帧、快进。
     // 因此重编码并逐段重置 PTS/DTS，统一帧率/像素格式/采样率，保证音视频严格连续。兼容有/无音频。
     const firstSeg = segAbsList[0];
@@ -389,15 +436,40 @@ class Merger extends EventEmitter {
       segAbsList.length > 0 ? this._hasAudio(exe, concat.cwd, firstSeg) : Promise.resolve(true),
       segAbsList.length > 0 ? this._probeFps(exe, concat.cwd, firstSeg) : Promise.resolve(null)
     ]);
+
+    // —— 总时长（驱动真实编码进度）——
+    // concat demuxer 不报告 Duration，ffmpeg-static 也不带 ffprobe，故批量读取各分片
+    // 头部的 Duration 求和，得到与 -progress 的 out_time 同一时间基下的总时长。
+    const segDurs = await this._probeSegDurations(exe, concat.cwd, segAbsList);
+    const knownDur = segDurs.filter((d) => d && d > 0);
+    const avgDur = knownDur.length ? knownDur.reduce((a, b) => a + b, 0) / knownDur.length : 10;
+    const durList = segDurs.map((d) => (d && d > 0 ? d : avgDur));
+    const cumEnd = [];
+    let accDur = 0;
+    for (const d of durList) { accDur += d; cumEnd.push(accDur); }
+    const totalDurSec = accDur > 0 ? accDur : totalFiles * 10;
+
     // 跟随源帧率归一化（探测不到时函数内部回退 30）
     const args = buildConcatEncodeArgs(concat.listArg, concat.safe, finalOutput, useAudio, srcFps);
 
-    const applySegProgress = () => {
+    // 进度：解析 ffmpeg `-progress` 的 out_time，换算为真实百分比；分片序号由累计时长反推
+    let lastIndex = 1;
+    const onProgress = (block) => {
+      let us = parseInt(block.out_time_us, 10);
+      if (!isFinite(us)) us = parseInt(block.out_time_ms, 10) * 1000; // 个别版本早期为 N/A，回退毫秒字段
+      if (!isFinite(us) || us < 0) return;
+      const tSec = us / 1e6;
+      let idx = lastIndex;
+      while (idx < totalFiles && cumEnd[idx - 1] < tSec) idx++;
+      lastIndex = idx;
+      // 按已编码媒体时间占比推进，封顶 99，完成时再置 100
+      const percent = totalDurSec > 0
+        ? Math.max(0, Math.min(99, Math.round((tSec / totalDurSec) * 100))) : 0;
+      const spd = (block.speed && block.speed !== 'N/A') ? ` · ${block.speed}` : '';
       job.segIndex = lastIndex;
       job.segName = segAbsList[lastIndex - 1] ? path.basename(segAbsList[lastIndex - 1]) : '';
-      // 进度条按已进入合并的分片占比推进，封顶 99，完成时再置 100
-      job.percent = totalFiles > 0 ? Math.min(99, Math.round((lastIndex / totalFiles) * 100)) : 0;
-      job.message = `合并中（第 ${lastIndex}/${totalFiles} 片）`;
+      job.percent = percent;
+      job.message = `合并中（第 ${lastIndex}/${totalFiles} 片${spd}）`;
       this.emit('update', job);
     };
 
@@ -405,20 +477,24 @@ class Merger extends EventEmitter {
       const proc = spawn(exe, args, { cwd: concat.cwd, windowsHide: true });
       this.procs.set(id, proc);
       let stderr = '';
+      let outLine = '';
+      let block = {};
 
-      proc.stderr.on('data', (d) => {
-        const s = d.toString();
-        stderr += s;
-        // concat demuxer 解码时逐个打开分片：Opening '<文件名>'（可能一次 data 含多个）
-        const re = /Opening '([^']+\.ts)'/g;
-        let m;
-        while ((m = re.exec(s)) !== null) {
-          const base = path.basename(m[1].replace(/\//g, path.sep));
-          const idx = segOrder.get(base);
-          // 同名分片在重试/seek 时可能重复出现，取最大序号，保证单调
-          if (idx && idx > lastIndex) { lastIndex = idx; applySegProgress(); }
+      // `-progress pipe:1`：每 stats_period 输出一组 key=value，以 progress=continue/end 收尾
+      proc.stdout.on('data', (d) => {
+        outLine += d.toString();
+        let nl;
+        while ((nl = outLine.indexOf('\n')) >= 0) {
+          const line = outLine.slice(0, nl).trim();
+          outLine = outLine.slice(nl + 1);
+          const eq = line.indexOf('=');
+          if (eq < 0) continue;
+          block[line.slice(0, eq)] = line.slice(eq + 1);
+          if (line.startsWith('progress=')) { onProgress(block); block = {}; }
         }
+        if (outLine.length > 65536) outLine = outLine.slice(-4096);
       });
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
       proc.on('error', (err) => {
         job.status = 'error';
         job.message = err.message;
